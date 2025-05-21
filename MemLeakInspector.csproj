@@ -7,6 +7,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Reference Include="0Harmony">
+      <HintPath>..\..\..\..\..\AppData\Roaming\VintageStory\VS120-rc8\Vintagestory\Lib\0Harmony.dll</HintPath>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>..\..\..\..\..\AppData\Roaming\VintageStory\VS120-rc8\Vintagestory\Lib\Newtonsoft.Json.dll</HintPath>
+    </Reference>
     <Reference Include="VintagestoryAPI">
       <HintPath>..\..\..\..\..\AppData\Roaming\VintageStory\VS120-rc8\Vintagestory\VintagestoryAPI.dll</HintPath>
     </Reference>

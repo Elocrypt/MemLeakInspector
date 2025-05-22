@@ -1,22 +1,53 @@
 ﻿using HarmonyLib;
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Vintagestory.API.Common;
 using Vintagestory.API.Server;
+using static MemLeakInspector.MemLeakInspectorConfig;
 
 
 namespace MemLeakInspector
 {
     public class MemLeakInspectorModSystem : ModSystem
     {
+        private static readonly JsonSerializerOptions jsonOpts = new() { WriteIndented = true };
+        private static readonly Dictionary<string, int> typeSizeCache = new();
+        private static readonly Dictionary<Type, int> primitiveSizes = new()
+        {
+            [typeof(bool)] = 1,
+            [typeof(byte)] = 1,
+            [typeof(sbyte)] = 1,
+            [typeof(short)] = 2,
+            [typeof(ushort)] = 2,
+            [typeof(int)] = 4,
+            [typeof(uint)] = 4,
+            [typeof(long)] = 8,
+            [typeof(ulong)] = 8,
+            [typeof(char)] = 2,
+            [typeof(float)] = 4,
+            [typeof(double)] = 8,
+            [typeof(decimal)] = 16,
+            [typeof(string)] = 24,  // Rough base string overhead
+            [typeof(object)] = 8    // Fallback object ref
+        };
+
+        private MemSnapshot? lastAlertSnapshot = null;
+        private long? alertWatcherListenerId = null;
+
         private Dictionary<string, WatchedType> activeWatches = new();
         private long? heatWatcherListenerId = null;
+
         private Dictionary<string, int> lastHeatSnapshot = new();
         private int heatThreshold = 100;
         private long? autoSnapshotListenerId = null;
 
         private ICoreServerAPI sapi = null!;
         private string snapshotDir = null!;
+
+        private bool snapshotRunning = false;
+
+        private MemLeakInspectorConfig? config;
 
         #region Entry Points
 
@@ -38,6 +69,8 @@ namespace MemLeakInspector
 
             RegisterServerCommands(api);
 
+            config = api.LoadModConfig<MemLeakInspectorConfig>("MemLeakInspectorConfig.json") ?? new MemLeakInspectorConfig();
+            api.StoreModConfig(config, "MemLeakInspectorConfig.json");
             sapi.Logger.Notification("[MemLeakInspector] Initialized.");
         }
 
@@ -70,6 +103,22 @@ namespace MemLeakInspector
                 .Create("mem")
                 .WithDescription("Memory debugging tools (MemLeakInspector)")
                 .RequiresPrivilege("controlserver")
+
+                .BeginSubCommand("alertwatch")
+                    .WithDescription("Start real-time memory/instance spike detection.")
+                    .HandleWith(_ =>
+                    {
+                        return StartAlertWatcher();
+                    })
+                .EndSubCommand()
+
+                .BeginSubCommand("alertstop")
+                    .WithDescription("Stop real-time spike detection.")
+                    .HandleWith(_ =>
+                    {
+                        return StopAlertWatcher();
+                    })
+                .EndSubCommand()
 
                 .BeginSubCommand("snap")
                     .WithDescription("Take a memory snapshot. Optionally provide a name.")
@@ -304,6 +353,19 @@ namespace MemLeakInspector
                         int limit = ctx.Parsers[0].GetValue() is int i ? i : 30;
                         return ExportAllGraphs(limit);
                     })
+                .EndSubCommand()
+
+                .BeginSubCommand("memusage")
+                    .WithDescription("Show estimated memory usage by type from a snapshot: /mem memusage <snapshotName>")
+                    .WithArgs(sapi.ChatCommands.Parsers.Word("snapshotName"))
+                    .HandleWith(ctx =>
+                    {
+                        string? name = ctx.Parsers[0].GetValue()?.ToString();
+                        if (string.IsNullOrWhiteSpace(name))
+                            return TextCommandResult.Error("[MemLeakInspector] Please provide a snapshot name.");
+
+                        return ShowMemoryUsageFromSnapshot(name);
+                    })
                 .EndSubCommand();
 
             sapi.Logger.Notification("[MemLeakInspector] Chat commands registered.");
@@ -332,24 +394,103 @@ namespace MemLeakInspector
 
         #region Command Logic
 
+        private TextCommandResult StartAlertWatcher()
+        {
+            if (alertWatcherListenerId != null)
+                return TextCommandResult.Error("[MemLeakInspector] Alert watcher is already running.");
+
+            lastAlertSnapshot = TakeSnapshot();
+
+            alertWatcherListenerId = sapi.Event.RegisterGameTickListener(dt =>
+            {
+                if (!snapshotRunning)
+                {
+                    snapshotRunning = true;
+
+                    Task.Run(() =>
+                    {
+                        try
+                        {
+                            var current = TakeSnapshot();
+                            SaveSnapshotToDisk(current);
+
+                            if (lastAlertSnapshot == null) {
+                                lastAlertSnapshot = current;
+                                return;
+                            }
+
+                            var oldCounts = lastAlertSnapshot.ObjectCountsByType;
+                            var newCounts = current.ObjectCountsByType;
+
+                            var spikeThreshold = config?.AlertInstanceSpike ?? 500;
+                            var memoryThreshold = (config?.AlertMemorySpikeMB ?? 100.0) * 1024 * 1024;
+
+                            long memDelta = current.TotalManagedMemoryBytes - lastAlertSnapshot.TotalManagedMemoryBytes;
+                            if (memDelta >= memoryThreshold)
+                            {
+                                sapi.Logger.Warning($"[MemLeakInspector] MEMORY SPIKE: +{memDelta / (1024 * 1024)} MB");
+                            }
+
+                            foreach (var key in newCounts.Keys)
+                            {
+                                if (IsIgnoredType(key)) continue;
+                                int old = oldCounts.TryGetValue(key, out var o) ? o : 0;
+                                int now = newCounts[key];
+                                int delta = now - old;
+
+                                if (delta >= spikeThreshold)
+                                {
+                                    sapi.Logger.Warning($"[MemLeakInspector] INSTANCE SPIKE: {key} grew by {delta} ({old} → {now})");
+                                }
+                            }
+
+                            lastAlertSnapshot = current;
+                        }
+                        catch (Exception ex)
+                        {
+                            sapi.Logger.Error("[MemLeakInspector] Snapshot failed: " + ex.Message);
+                        }
+                        finally
+                        {
+                            snapshotRunning = false;
+                        }
+                    });
+                }
+            }, (config?.AlertCheckIntervalSec ?? 30) * 1000);
+            return TextCommandResult.Success("[MemLeakInspector] Alert watcher started.");
+        }
+
+        private TextCommandResult StopAlertWatcher()
+        {
+            if (alertWatcherListenerId != null)
+            {
+                sapi.Event.UnregisterGameTickListener(alertWatcherListenerId.Value);
+                alertWatcherListenerId = null;
+                return TextCommandResult.Success("[MemLeakInspector] Alert watcher stopped.");
+            }
+            return TextCommandResult.Success("[MemLeakInspector] No alert watcher running.");
+        }
+
         private TextCommandResult CmdMemSnap(string name)
         {
-            try
+            Task.Run(() =>
             {
-                MemSnapshot snapshot = TakeSnapshot();
-                string json = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true });
+                try
+                {
+                    var snapshot = TakeSnapshot();
+                    var json = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true });
+                    var filePath = Path.Combine(snapshotDir, $"{name}.json");
+                    File.WriteAllText(filePath, json);
 
-                string filePath = Path.Combine(snapshotDir, $"{name}.json");
-                File.WriteAllText(filePath, json);
+                    sapi.Logger.Notification($"[MemLeakInspector] Snapshot '{name}' saved ({snapshot.TotalManagedMemoryBytes / 1024 / 1024} MB)");
+                }
+                catch (Exception ex)
+                {
+                    sapi.Logger.Error($"[MemLeakInspector] Snapshot failed: {ex.Message}");
+                }
+            });
 
-                return TextCommandResult.Success(
-                    $"[MemLeakInspector] Snapshot '{name}' saved ({snapshot.TotalManagedMemoryBytes / 1024 / 1024} MB)"
-                );
-            }
-            catch (Exception ex)
-            {
-                return TextCommandResult.Error($"[MemLeakInspector] Snapshot failed: {ex.Message}");
-            }
+            return TextCommandResult.Success("[MemLeakInspector] Snapshotting in background...");
         }
 
         private TextCommandResult CmdDiffSnapshots(string nameA, string nameB)
@@ -658,21 +799,60 @@ namespace MemLeakInspector
             return TextCommandResult.Success("[MemLeakInspector] All watched graphs exported.");
         }
 
+        private TextCommandResult ShowMemoryUsageFromSnapshot(string snapshotName)
+        {
+            var path = Path.Combine(snapshotDir, $"{snapshotName}.json");
+            if (!File.Exists(path))
+                return TextCommandResult.Error($"[MemLeakInspector] Snapshot '{snapshotName}' not found.");
+
+            var json = File.ReadAllText(path);
+            var snapshot = JsonSerializer.Deserialize<MemSnapshot>(json);
+            if (snapshot?.EstimatedBytesPerType != null)
+            {
+                foreach (var kvp in snapshot.EstimatedBytesPerType)
+                    typeSizeCache[kvp.Key] = kvp.Value;
+            }
+
+            if (snapshot?.EstimatedMemoryBytesPerType == null || snapshot.EstimatedMemoryBytesPerType.Count == 0)
+                return TextCommandResult.Error("[MemLeakInspector] Snapshot is missing memory data.");
+
+            sapi.Logger.Notification($"[MemLeakInspector] Estimated memory usage in '{snapshotName}':");
+
+            foreach (var entry in snapshot.EstimatedMemoryBytesPerType
+                .OrderByDescending(kv => kv.Value))
+            {
+                double estimatedMB = entry.Value / (1024.0 * 1024.0);
+
+                if (estimatedMB < config?.ReportFilterMB)
+                    continue;
+                sapi.Logger.Notification($"    {entry.Key} = {estimatedMB:F1} MB");
+            }
+
+            return TextCommandResult.Success("[MemLeakInspector] Memory usage report complete.");
+        }
+
         #endregion
 
         #region Snapshot Logic
 
-        private MemSnapshot TakeSnapshot()
+        private static MemSnapshot TakeSnapshot()
         {
             GC.Collect();
             GC.WaitForPendingFinalizers();
             GC.Collect();
 
+            var counts = InstanceTracker.GetLiveCounts();
+
             var snapshot = new MemSnapshot
             {
                 Timestamp = DateTime.UtcNow,
                 TotalManagedMemoryBytes = GC.GetTotalMemory(forceFullCollection: true),
-                ObjectCountsByType = InstanceTracker.GetLiveCounts()
+                ObjectCountsByType = counts,
+                EstimatedBytesPerType = new Dictionary<string, int>(typeSizeCache),
+                EstimatedMemoryBytesPerType = counts.ToDictionary(
+                    kvp => kvp.Key,
+                    kvp => EstimateTypeSize(kvp.Key, kvp.Value)
+                )
             };
 
             Console.WriteLine($"[DEBUG] Snapshot contains {snapshot.ObjectCountsByType.Count} tracked types.");
@@ -752,6 +932,15 @@ namespace MemLeakInspector
             sapi.Logger.Notification($"[MemLeakInspector] {status}: {typeName} = {currentCount} ({(delta >= 0 ? "+" : "")}{delta})");
         }
 
+        private void SaveSnapshotToDisk(MemSnapshot snap)
+        {
+            var json = JsonSerializer.Serialize(snap, jsonOpts);
+            var path = Path.Combine(snapshotDir, $"{snap.Timestamp:yyyyMMdd_HHmmss}.json");
+            File.WriteAllText(path, json);
+
+            sapi.Logger.Notification($"[MemLeakInspector] Snapshot saved: {Path.GetFileName(path)}");
+        }
+
         private void StartAutoSnapshot(int intervalSec)
         {
             if (autoSnapshotListenerId.HasValue)
@@ -812,6 +1001,54 @@ namespace MemLeakInspector
                 // Tweak limit maybe
 
             }, 10000); // every 10s
+        }
+
+        private static long EstimateTypeSize(string typeName, int instanceCount)
+        {
+            if (typeSizeCache.TryGetValue(typeName, out int cached))
+                return (long)cached * instanceCount;
+
+            try
+            {
+                Type? type = Type.GetType(typeName, throwOnError: false);
+                if (type == null)
+                    return instanceCount * 300; // fallback if type not found
+
+                int size = 0;
+
+                foreach (FieldInfo field in type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    if (field.FieldType.IsValueType && primitiveSizes.TryGetValue(field.FieldType, out int primSize))
+                    {
+                        size += primSize;
+                    }
+                    else if (field.FieldType == typeof(string))
+                    {
+                        size += primitiveSizes[typeof(string)];
+                    }
+                    else
+                    {
+                        size += 8; // Pointer/reference size assumption
+                    }
+                }
+
+                if (size == 0)
+                    size = 300; // fallback for types with no visible fields
+
+                typeSizeCache[typeName] = size;
+                return (long)size * instanceCount;
+            }
+            catch
+            {
+                return instanceCount * 300;
+            }
+        }
+
+        private bool IsIgnoredType(string typeName)
+        {
+            return config.IgnoreSpikeTypeFragments.Any(fragment =>
+                typeName.IndexOf(fragment, StringComparison.OrdinalIgnoreCase) >= 0
+            );
         }
 
         private class WatchedType

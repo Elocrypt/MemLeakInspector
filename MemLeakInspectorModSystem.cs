@@ -1,18 +1,41 @@
 ﻿using HarmonyLib;
 using System.Reflection;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using Vintagestory.API.Common;
 using Vintagestory.API.Server;
-using static MemLeakInspector.MemLeakInspectorConfig;
 
 
 namespace MemLeakInspector
 {
+    /// <summary>
+    /// This class defines the mod system for MemLeakInspector, a tool used to monitor and debug memory leaks in Vintage Story servers.
+    /// It provides command-based interfaces for taking snapshots, tracking object types, watching for spikes, and exporting diagnostics.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Developer Notes:</b></para>
+    /// <para>- Snapshots are serialized into JSON and saved to disk. Each snapshot contains instance counts and optionally tracked instance IDs.</para>
+    /// <para>- The mod leverages weak references and runtime reflection to monitor live objects without impacting GC behavior.</para>
+    /// <para>- Harmony patches are applied to automatically register entities and block entities for tracking.</para>
+    /// <para>- Use /mem snap, /mem diff, /mem heatmap, etc. to interact via chat commands.</para>
+    /// <para>- To reduce false positives, use IgnoreSpikeTypeFragments in the config to exclude known volatile objects like particles.</para>
+    /// </remarks>
     public class MemLeakInspectorModSystem : ModSystem
     {
+        /// <summary>
+        /// Configurable serializer settings for JSON output.
+        /// Used when saving snapshot data to disk.
+        /// </summary>
         private static readonly JsonSerializerOptions jsonOpts = new() { WriteIndented = true };
+
+        /// <summary>
+        /// Cache of estimated sizes of each type, used for memory estimation reports.
+        /// </summary>
         private static readonly Dictionary<string, int> typeSizeCache = new();
+
+        /// <summary>
+        /// Hardcoded sizes for primitive types used when estimating memory usage.
+        /// These values are used as a fallback when reflecting on unknown fields.
+        /// </summary>
         private static readonly Dictionary<Type, int> primitiveSizes = new()
         {
             [typeof(bool)] = 1,
@@ -28,25 +51,67 @@ namespace MemLeakInspector
             [typeof(float)] = 4,
             [typeof(double)] = 8,
             [typeof(decimal)] = 16,
-            [typeof(string)] = 24,  // Rough base string overhead
-            [typeof(object)] = 8    // Fallback object ref
+            [typeof(string)] = 24,  // Estimated string object header size
+            [typeof(object)] = 8    // Estimated reference pointer size
         };
 
+        /// <summary>
+        /// The most recent snapshot used for detecting memory spikes.
+        /// Only updated when alert watcher is enabled.
+        /// </summary>
         private MemSnapshot? lastAlertSnapshot = null;
+
+        /// <summary>
+        /// Game tick listener ID for the alert watcher task.
+        /// Used to stop the task when disabling the watcher.
+        /// </summary>
         private long? alertWatcherListenerId = null;
 
+        /// <summary>
+        /// Active type watchers that track individual types' instance growth over time.
+        /// </summary>
         private Dictionary<string, WatchedType> activeWatches = new();
+
+        /// <summary>
+        /// Listener ID for real-time heatmap leak detection.
+        /// </summary>
         private long? heatWatcherListenerId = null;
 
+        /// <summary>
+        /// Instance counts per type from the last heatmap polling interval.
+        /// Used to compare against the current state to detect growth deltas.
+        /// </summary>
         private Dictionary<string, int> lastHeatSnapshot = new();
+
+        /// <summary>
+        /// Minimum number of new instances required to consider a type as "leaking".
+        /// </summary>
         private int heatThreshold = 100;
+
+        /// <summary>
+        /// Listener ID for automated snapshot collection.
+        /// </summary>
         private long? autoSnapshotListenerId = null;
 
+        /// <summary>
+        /// Server API instance used throughout the mod for file I/O, logging, and command handling.
+        /// </summary>
         private ICoreServerAPI sapi = null!;
+
+        /// <summary>
+        /// Absolute path where snapshot JSON and CSV files will be saved.
+        /// </summary>
         private string snapshotDir = null!;
 
+        /// <summary>
+        /// Whether a snapshot is currently being processed.
+        /// This helps prevent overlapping snapshot jobs.
+        /// </summary>
         private bool snapshotRunning = false;
 
+        /// <summary>
+        /// Loaded configuration values from MemLeakInspectorConfig.json.
+        /// </summary>
         private MemLeakInspectorConfig? config;
 
         #region Entry Points
@@ -366,6 +431,23 @@ namespace MemLeakInspector
 
                         return ShowMemoryUsageFromSnapshot(name);
                     })
+                .EndSubCommand()
+
+                .BeginSubCommand("tp")
+                    .WithDescription("Teleport to a tracked instance ID")
+                    .WithArgs(sapi.ChatCommands.Parsers.Word("id"))
+                    .HandleWith(ctx =>
+                    {
+                        var player = ctx.Caller.Player;
+                        var id = ctx.Parsers[0].GetValue() as string;
+
+                        var pos = InstanceTracker.GetPositionById(id);
+                        if (pos == null)
+                            return TextCommandResult.Error($"[MemLeakInspector] No instance found with ID prefix '{id}'.");
+
+                        player.Entity.TeleportToDouble(pos.X + 0.5, pos.Y + 1, pos.Z + 0.5);
+                        return TextCommandResult.Success($"[MemLeakInspector] Teleported to instance {id}.");
+                    })
                 .EndSubCommand();
 
             sapi.Logger.Notification("[MemLeakInspector] Chat commands registered.");
@@ -394,12 +476,20 @@ namespace MemLeakInspector
 
         #region Command Logic
 
+        /// <summary>
+        /// Begins monitoring for sudden memory or instance count spikes.
+        /// </summary>
+        /// <returns>A command result indicating if the watcher was started.</returns>
+        /// <remarks>
+        /// Uses a recurring task that compares snapshots on an interval.
+        /// Alerts are logged for memory deltas or instance type growth beyond thresholds.
+        /// </remarks>
         private TextCommandResult StartAlertWatcher()
         {
             if (alertWatcherListenerId != null)
                 return TextCommandResult.Error("[MemLeakInspector] Alert watcher is already running.");
 
-            lastAlertSnapshot = TakeSnapshot();
+            lastAlertSnapshot = TakeSnapshot(config);
 
             alertWatcherListenerId = sapi.Event.RegisterGameTickListener(dt =>
             {
@@ -411,7 +501,7 @@ namespace MemLeakInspector
                     {
                         try
                         {
-                            var current = TakeSnapshot();
+                            var current = TakeSnapshot(config);
                             SaveSnapshotToDisk(current);
 
                             if (lastAlertSnapshot == null) {
@@ -460,6 +550,10 @@ namespace MemLeakInspector
             return TextCommandResult.Success("[MemLeakInspector] Alert watcher started.");
         }
 
+        /// <summary>
+        /// Stops the alert watcher task.
+        /// </summary>
+        /// <returns>A success result whether or not the watcher was running.</returns>
         private TextCommandResult StopAlertWatcher()
         {
             if (alertWatcherListenerId != null)
@@ -471,13 +565,21 @@ namespace MemLeakInspector
             return TextCommandResult.Success("[MemLeakInspector] No alert watcher running.");
         }
 
+        /// <summary>
+        /// Saves a snapshot of the current state to a uniquely named JSON file.
+        /// </summary>
+        /// <param name="name">The custom or auto-generated filename (no extension).</param>
+        /// <returns>Success message indicating that snapshotting has started.</returns>
+        /// <remarks>
+        /// Runs in a background thread to avoid stalling server tick. JSON is saved in the mod's snapshot directory.
+        /// </remarks>
         private TextCommandResult CmdMemSnap(string name)
         {
             Task.Run(() =>
             {
                 try
                 {
-                    var snapshot = TakeSnapshot();
+                    var snapshot = TakeSnapshot(config);
                     var json = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true });
                     var filePath = Path.Combine(snapshotDir, $"{name}.json");
                     File.WriteAllText(filePath, json);
@@ -493,6 +595,15 @@ namespace MemLeakInspector
             return TextCommandResult.Success("[MemLeakInspector] Snapshotting in background...");
         }
 
+        /// <summary>
+        /// Compares two snapshots and logs a diff of object counts and tracked IDs.
+        /// </summary>
+        /// <param name="nameA">The older snapshot filename (without extension).</param>
+        /// <param name="nameB">The newer snapshot filename (without extension).</param>
+        /// <returns>A formatted diff log as chat output and disk export.</returns>
+        /// <remarks>
+        /// Tracks both instance counts and specific added/removed instance IDs if available in both snapshots.
+        /// </remarks>
         private TextCommandResult CmdDiffSnapshots(string nameA, string nameB)
         {
             string fileA = Path.Combine(snapshotDir, $"{nameA}.json");
@@ -527,9 +638,44 @@ namespace MemLeakInspector
                     if (delta != 0)
                         resultLines.Add($"{(delta > 0 ? "+" : "")}{delta,4}  {key}");
                 }
+                if (config!.TrackIndividualEntities &&
+                    snapA.TrackedInstancesByType != null &&
+                    snapB.TrackedInstancesByType != null)
+                {
+                    resultLines.Add("Changed instances:");
+
+                    foreach (var type in snapA.TrackedInstancesByType.Keys)
+                    {
+                        if (!snapB.TrackedInstancesByType.TryGetValue(type, out var newSet))
+                            continue;
+
+                        var oldSet = snapA.TrackedInstancesByType[type];
+                        var added = newSet.Except(oldSet).ToList();
+                        var removed = oldSet.Except(newSet).ToList();
+
+                        if (added.Count > 0 || removed.Count > 0)
+                        {
+                            string formattedName = FormatTypeName(type);
+                            resultLines.Add($"• {formattedName} → +{added.Count}, -{removed.Count}");
+
+                            if (config.VerboseInstanceDiff)
+                            {
+                                foreach (var id in added)
+                                    resultLines.Add($"    + ID: {id}");
+                                foreach (var id in removed)
+                                    resultLines.Add($"    - ID: {id}");
+                            }
+                        }
+                    }
+                }
 
                 if (resultLines.Count == 3)
                     resultLines.Add("No differences detected.");
+
+                string exportFile = Path.Combine(snapshotDir, $"diff_{nameA}_to_{nameB}.txt");
+                File.WriteAllLines(exportFile, resultLines);
+                resultLines.Add($"Diff exported to: {Path.GetFileName(exportFile)}");
+
 
                 return TextCommandResult.Success(string.Join("\n", resultLines));
             }
@@ -539,6 +685,14 @@ namespace MemLeakInspector
             }
         }
 
+        /// <summary>
+        /// Reports the top 10 most common object types from a snapshot.
+        /// </summary>
+        /// <param name="name">The snapshot name (without extension).</param>
+        /// <returns>A formatted report of top object counts by type.</returns>
+        /// <remarks>
+        /// Output is printed in chat for quick inspection. Only counts are shown, not memory estimates.
+        /// </remarks>
         private TextCommandResult CmdReportSnapshot(string name)
         {
             string filePath = Path.Combine(snapshotDir, $"{name}.json");
@@ -575,6 +729,15 @@ namespace MemLeakInspector
             }
         }
 
+        /// <summary>
+        /// Starts tracking a specific object type's instance count over time.
+        /// </summary>
+        /// <param name="typeName">The type to track (partial match allowed).</param>
+        /// <param name="intervalSec">Interval in seconds to poll and log instance counts.</param>
+        /// <returns>Command result confirming watcher registration or error.</returns>
+        /// <remarks>
+        /// The watcher logs growth trends and stores data for graph export. Multiple types can be watched in parallel.
+        /// </remarks>
         private TextCommandResult StartWatcher(string typeName, int intervalSec)
         {
             if (activeWatches.ContainsKey(typeName))
@@ -594,6 +757,14 @@ namespace MemLeakInspector
             return TextCommandResult.Success($"[MemLeakInspector] Now watching '{typeName}' every {intervalSec}s.");
         }
 
+        /// <summary>
+        /// Exports a snapshot to a CSV file for use in spreadsheets or analysis.
+        /// </summary>
+        /// <param name="name">The snapshot name (without extension).</param>
+        /// <returns>A command result indicating success or failure.</returns>
+        /// <remarks>
+        /// CSV format includes type name and instance count, and will be expanded to include tracked IDs in future versions.
+        /// </remarks>
         private TextCommandResult ExportSnapshotToCsv(string name)
         {
             string jsonPath = Path.Combine(snapshotDir, $"{name}.json");
@@ -624,6 +795,16 @@ namespace MemLeakInspector
             }
         }
 
+        /// <summary>
+        /// Generates a heatmap-style delta between two snapshots and prints the top growth/shrinkage types.
+        /// </summary>
+        /// <param name="oldName">Snapshot name to use as the baseline (older).</param>
+        /// <param name="newName">Snapshot name to compare against (newer).</param>
+        /// <returns>A command result with the summary log output.</returns>
+        /// <remarks>
+        /// Useful for quickly diagnosing leak-prone or noisy systems over time.
+        /// Printed output ranks types by the absolute delta.
+        /// </remarks>
         private TextCommandResult CmdHeatmap(string oldName, string newName)
         {
             string pathA = Path.Combine(snapshotDir, $"{oldName}.json");
@@ -664,6 +845,15 @@ namespace MemLeakInspector
             return TextCommandResult.Success("[MemLeakInspector] Heatmap generated.");
         }
 
+        /// <summary>
+        /// Exports the heatmap-style delta of two snapshots to a CSV file.
+        /// </summary>
+        /// <param name="oldName">Snapshot name used as the baseline.</param>
+        /// <param name="newName">Snapshot name to compare against.</param>
+        /// <returns>Success or error message for the CSV export.</returns>
+        /// <remarks>
+        /// Outputs a CSV with two columns: type name and instance delta. Sorted by largest absolute change.
+        /// </remarks>
         private TextCommandResult ExportHeatmapCsv(string oldName, string newName)
         {
             string pathA = Path.Combine(snapshotDir, $"{oldName}.json");
@@ -702,6 +892,15 @@ namespace MemLeakInspector
             return TextCommandResult.Success($"[MemLeakInspector] Heatmap exported to: {Path.GetFileName(exportPath)}");
         }
 
+        /// <summary>
+        /// Aggregates the top types across N recent snapshots and reports average instance counts.
+        /// </summary>
+        /// <param name="snapshotCount">Number of recent snapshots to analyze.</param>
+        /// <returns>A textual summary of dominant object types.</returns>
+        /// <remarks>
+        /// This helps reveal persistent high-memory or overused systems.
+        /// Shows relative frequency and estimated memory size per type.
+        /// </remarks>
         private TextCommandResult CmdSummary(int snapshotCount)
         {
             var files = Directory.GetFiles(snapshotDir, "*.json")
@@ -713,37 +912,60 @@ namespace MemLeakInspector
                 return TextCommandResult.Error("[MemLeakInspector] No snapshots available.");
 
             var totals = new Dictionary<string, int>();
+            var memory = new Dictionary<string, long>();
 
             foreach (var file in files)
             {
                 var json = File.ReadAllText(file);
                 var snap = JsonSerializer.Deserialize<MemSnapshot>(json);
-
-                if (snap?.ObjectCountsByType == null)
-                    continue;
+                if (snap?.ObjectCountsByType == null) continue;
 
                 foreach (var kvp in snap.ObjectCountsByType)
                 {
-                    if (!totals.ContainsKey(kvp.Key))
-                        totals[kvp.Key] = 0;
-
+                    if (!totals.ContainsKey(kvp.Key)) totals[kvp.Key] = 0;
                     totals[kvp.Key] += kvp.Value;
                 }
-            }
 
+                if (snap.EstimatedMemoryBytesPerType != null)
+                {
+                    foreach (var kvp in snap.EstimatedMemoryBytesPerType)
+                    {
+                        if (!memory.ContainsKey(kvp.Key)) memory[kvp.Key] = 0;
+                        memory[kvp.Key] += kvp.Value;
+                    }
+                }
+            }
+            foreach (var key in totals.Keys.ToList())
+            {
+                totals[key] /= files.Count;
+            }
             if (totals.Count == 0)
                 return TextCommandResult.Success("[MemLeakInspector] Summary found no tracked types.");
 
             sapi.Logger.Notification($"[MemLeakInspector] Summary across {files.Count} snapshots:");
 
+            int max = totals.Max(kv =>  kv.Value);
+
             foreach (var entry in totals.OrderByDescending(kv => kv.Value).Take(10))
             {
-                sapi.Logger.Notification($"  {entry.Value,5} × {entry.Key}");
+                string bar = AsciiBar(entry.Value, max);
+                memory.TryGetValue(entry.Key, out long memBytes);
+                double memMB = memBytes / (1024  * 1024);
+                sapi.Logger.Notification($"{bar}  {entry.Value,5} x {entry.Key,-60} ≈ {memMB,6:F1} MB");
             }
 
             return TextCommandResult.Success("[MemLeakInspector] Summary complete.");
         }
 
+        /// <summary>
+        /// Exports the count of a specific type across a time-series of snapshots to a CSV file.
+        /// </summary>
+        /// <param name="typeName">Type name to track over time (partial match allowed).</param>
+        /// <param name="limit">Max number of snapshots to analyze (default 20).</param>
+        /// <returns>Command result containing export status.</returns>
+        /// <remarks>
+        /// Useful for graphing leak growth in Excel or plotting tools.
+        /// </remarks>
         private TextCommandResult CmdGraphType(string typeName, int limit)
         {
             var files = Directory.GetFiles(snapshotDir, "*.json")
@@ -757,34 +979,60 @@ namespace MemLeakInspector
 
             string exportPath = Path.Combine(snapshotDir, $"graph_{typeName.Replace(":", "_")}.csv");
 
-            using var writer = new StreamWriter(exportPath);
-            writer.WriteLine("Timestamp,InstanceCount");
+            var dataPoints = new List<(DateTime time, int count)>();
 
-            foreach (var file in files)
+            using (var writer = new StreamWriter(exportPath))
             {
-                var json = File.ReadAllText(file);
-                var snap = JsonSerializer.Deserialize<MemSnapshot>(json);
+                writer.WriteLine("Timestamp,InstanceCount");
 
-                sapi.Logger.Notification($"[MemLeakInspector] Reading {Path.GetFileName(file)} → Timestamp: {snap?.Timestamp:O}");
+                foreach (var file in files)
+                {
+                    var json = File.ReadAllText(file);
+                    var snap = JsonSerializer.Deserialize<MemSnapshot>(json);
+
+                    sapi.Logger.Notification($"[MemLeakInspector] Reading {Path.GetFileName(file)} → Timestamp: {snap?.Timestamp:O}");
 
 
-                if (snap == null || snap.Timestamp == default || snap.ObjectCountsByType == null)
-                    continue;
+                    if (snap == null || snap.Timestamp == default || snap.ObjectCountsByType == null)
+                        continue;
 
-                var matching = snap.ObjectCountsByType
-                    .Where(kvp => kvp.Key.Contains(typeName, StringComparison.OrdinalIgnoreCase))
-                    .ToList();
+                    var matching = snap.ObjectCountsByType
+                        .Where(kvp => kvp.Key.Contains(typeName, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
 
-                int count = matching.Sum(kvp => kvp.Value);
+                    int count = matching.Sum(kvp => kvp.Value);
+                    dataPoints.Add((snap.Timestamp, count));
 
-                writer.WriteLine($"{snap.Timestamp:yyyy-MM-dd HH:mm:ss},{count}");
+                    writer.WriteLine($"{snap.Timestamp:yyyy-MM-dd HH:mm:ss},{count}");
 
-                sapi.Logger.Notification($"[MemLeakInspector] Snapshot {Path.GetFileName(file)} matched count: {count}");
+                    sapi.Logger.Notification($"[MemLeakInspector] Snapshot {Path.GetFileName(file)} matched count: {count}");
+                }
+            }
+            sapi.Logger.Notification($"[MemLeakInspector] Instance history for '{typeName}':");
+
+            int maxCount = dataPoints.Max(dp => dp.count);
+            int? previous = null;
+
+            foreach (var (time, count) in dataPoints)
+            {
+                int delta = previous.HasValue ? (count - previous.Value) : 0;
+                string deltaStr = previous.HasValue ? $" ({(delta >= 0 ? "+" : "")}{delta})" : "";
+                string bar = AsciiBar(count, maxCount);
+                sapi.Logger.Notification($"{time:HH:mm:ss} {bar} {count}{deltaStr}");
+                previous = count;
             }
 
             return TextCommandResult.Success($"[MemLeakInspector] Graph exported to: {Path.GetFileName(exportPath)}");
         }
 
+        /// <summary>
+        /// Batch-export graphs for all currently watched types.
+        /// </summary>
+        /// <param name="limit">Number of recent snapshots to include per graph.</param>
+        /// <returns>Success message after generating all graph CSVs.</returns>
+        /// <remarks>
+        /// Affects all types registered via /mem watch.
+        /// </remarks>
         private TextCommandResult ExportAllGraphs(int limit)
         {
             if (activeWatches.Count == 0)
@@ -799,6 +1047,14 @@ namespace MemLeakInspector
             return TextCommandResult.Success("[MemLeakInspector] All watched graphs exported.");
         }
 
+        /// <summary>
+        /// Shows estimated memory usage (in MB) per type based on a snapshot.
+        /// </summary>
+        /// <param name="snapshotName">Name of the snapshot file (no extension).</param>
+        /// <returns>List of memory usage per tracked type.</returns>
+        /// <remarks>
+        /// Uses cached or inferred type sizes. Results are approximate and should be interpreted accordingly.
+        /// </remarks>
         private TextCommandResult ShowMemoryUsageFromSnapshot(string snapshotName)
         {
             var path = Path.Combine(snapshotDir, $"{snapshotName}.json");
@@ -835,19 +1091,35 @@ namespace MemLeakInspector
 
         #region Snapshot Logic
 
-        private static MemSnapshot TakeSnapshot()
+        /// <summary>
+        /// Takes a snapshot of all currently tracked instances, optionally including detailed tracked IDs.
+        /// </summary>
+        /// <param name="config">The mod configuration that controls whether individual instances are tracked.</param>
+        /// <returns>A MemSnapshot representing the state of managed memory at the current moment.</returns>
+        /// <remarks>
+        /// This method performs a full GC cycle before collecting data. The resulting snapshot contains per-type instance counts,
+        /// optional ID+position data, and estimated memory usage.
+        /// </remarks>
+        private static MemSnapshot TakeSnapshot(MemLeakInspectorConfig config)
         {
             GC.Collect();
             GC.WaitForPendingFinalizers();
             GC.Collect();
 
             var counts = InstanceTracker.GetLiveCounts();
+            Dictionary<string, List<InstanceTracker.InstanceInfo>>? instanceIds = null;
+
+            if (config.TrackIndividualEntities)
+            {
+                instanceIds = InstanceTracker.GetInstanceInfoByType();
+            }
 
             var snapshot = new MemSnapshot
             {
                 Timestamp = DateTime.UtcNow,
                 TotalManagedMemoryBytes = GC.GetTotalMemory(forceFullCollection: true),
                 ObjectCountsByType = counts,
+                TrackedInstancesByType = instanceIds,
                 EstimatedBytesPerType = new Dictionary<string, int>(typeSizeCache),
                 EstimatedMemoryBytesPerType = counts.ToDictionary(
                     kvp => kvp.Key,
@@ -859,6 +1131,13 @@ namespace MemLeakInspector
             return snapshot;
         }
 
+        /// <summary>
+        /// Writes a filtered snapshot to disk containing only types that match the given filter string.
+        /// </summary>
+        /// <param name="typeFilter">Substring to match against type names.</param>
+        /// <remarks>
+        /// Used internally during heatmap polling to focus snapshots on watched types only.
+        /// </remarks>
         private void SaveFilteredSnapshot(string typeFilter)
         {
             var snap = new MemSnapshot
@@ -890,6 +1169,13 @@ namespace MemLeakInspector
 
         #region Helpers
 
+        /// <summary>
+        /// Lists all available snapshot files found in the configured snapshot directory.
+        /// </summary>
+        /// <returns>Command result with filenames listed in chat.</returns>
+        /// <remarks>
+        /// Each snapshot is saved as a .json file, timestamped and optionally named.
+        /// </remarks>
         private TextCommandResult CmdListSnapshots()
         {
             if (!Directory.Exists(snapshotDir))
@@ -911,6 +1197,13 @@ namespace MemLeakInspector
             }
         }
 
+        /// <summary>
+        /// Checks the current instance count of a watched type and logs any growth or shrinkage.
+        /// </summary>
+        /// <param name="typeName">The name of the type being polled.</param>
+        /// <remarks>
+        /// Intended to be triggered on a repeating timer for each watched type.
+        /// </remarks>
         private void PollWatchedType(string typeName)
         {
             if (!activeWatches.TryGetValue(typeName, out var watch)) return;
@@ -941,6 +1234,13 @@ namespace MemLeakInspector
             sapi.Logger.Notification($"[MemLeakInspector] Snapshot saved: {Path.GetFileName(path)}");
         }
 
+        /// <summary>
+        /// Starts an automated snapshotting task that saves the current state on a timed interval.
+        /// </summary>
+        /// <param name="intervalSec">Interval in seconds between snapshots.</param>
+        /// <remarks>
+        /// Useful for passive background tracking. Each snapshot is timestamped and saved to disk.
+        /// </remarks>
         private void StartAutoSnapshot(int intervalSec)
         {
             if (autoSnapshotListenerId.HasValue)
@@ -956,6 +1256,12 @@ namespace MemLeakInspector
             }, intervalSec * 1000);
         }
 
+        /// <summary>
+        /// Begins a 10-second interval watcher to detect types that rapidly increase in instance count.
+        /// </summary>
+        /// <remarks>
+        /// Logs types that exceed the configured threshold. Snapshots and graphs are generated for leak auditing.
+        /// </remarks>
         private void StartHeatWatcher()
         {
             if (heatWatcherListenerId != null)
@@ -1003,6 +1309,15 @@ namespace MemLeakInspector
             }, 10000); // every 10s
         }
 
+        /// <summary>
+        /// Estimates the total memory usage for a given type based on its field layout and number of instances.
+        /// </summary>
+        /// <param name="typeName">The fully qualified name of the type to analyze.</param>
+        /// <param name="instanceCount">The number of instances to multiply against the estimated size.</param>
+        /// <returns>An estimated memory footprint in bytes.</returns>
+        /// <remarks>
+        /// Tries to reflect on field types to build a composite object size estimate. Falls back to a default size for unknown types.
+        /// </remarks>
         private static long EstimateTypeSize(string typeName, int instanceCount)
         {
             if (typeSizeCache.TryGetValue(typeName, out int cached))
@@ -1044,9 +1359,14 @@ namespace MemLeakInspector
             }
         }
 
+        /// <summary>
+        /// Determines whether the given type name should be ignored from reporting, based on configured fragments.
+        /// </summary>
+        /// <param name="typeName">The fully qualified type name to test.</param>
+        /// <returns>True if the type should be skipped in alerts or reports.</returns>
         private bool IsIgnoredType(string typeName)
         {
-            return config.IgnoreSpikeTypeFragments.Any(fragment =>
+            return config!.IgnoreSpikeTypeFragments.Any(fragment =>
                 typeName.IndexOf(fragment, StringComparison.OrdinalIgnoreCase) >= 0
             );
         }
@@ -1056,6 +1376,45 @@ namespace MemLeakInspector
             public string TypeName = "";
             public int IntervalSec = 30;
             public int LastCount = 0;
+        }
+
+        /// <summary>
+        /// Converts a complex type name into a more readable label.
+        /// </summary>
+        /// <param name="type">Full type identifier, optionally with domain and code (e.g. EntityDrifter:game:drifter-normal).</param>
+        /// <returns>A user-friendly string representation.</returns>
+        /// <remarks>
+        /// Useful for log output, collapsing namespaced identifiers into readable format.
+        /// </remarks>
+        private string FormatTypeName(string type)
+        {
+            // Expected format: "Vintagestory.GameContent.EntityDrifter:game:drifter-normal"
+            var parts = type.Split(':');
+            if (parts.Length == 3)
+            {
+                var shortType = parts[1]; // e.g. "game"
+                var code = parts[2];      // e.g. "drifter-normal"
+                var name = parts[0].Split('.').Last(); // e.g. "EntityDrifter"
+                return $"{name} ({shortType}:{code})";
+            }
+
+            return type;
+        }
+
+        /// <summary>
+        /// Generates a simple proportional ASCII bar to visually compare values.
+        /// </summary>
+        /// <param name="value">Current value to render.</param>
+        /// <param name="max">Maximum value in the dataset.</param>
+        /// <param name="width">Width of the bar in characters (default 20).</param>
+        /// <returns>String like: [####      ]</returns>
+        /// <remarks>
+        /// This is used in the graph and summary outputs.
+        /// </remarks>
+        private string AsciiBar(int value, int max, int width = 20)
+        {
+            int filled = Math.Clamp((int)((double)value / max * width), 0, width);
+            return "[" + new string('#', filled).PadRight(width, ' ') + "]";
         }
 
         #endregion

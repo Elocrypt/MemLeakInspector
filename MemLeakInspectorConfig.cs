@@ -52,5 +52,11 @@
         /// </summary>
         public bool VerboseInstanceDiff { get; set; } = false;
 
+
+        public bool AutoStartThreadWatcher { get; set; } = false;
+
+
+        public int ThreadWatcherIntervalSeconds { get; set; } = 30;
+
     }
 }

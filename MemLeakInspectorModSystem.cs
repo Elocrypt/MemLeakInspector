@@ -109,6 +109,18 @@ namespace MemLeakInspector
         /// </summary>
         private bool snapshotRunning = false;
 
+
+        private bool threadWatcherRunning = false;
+
+
+        private int threadWatcherIntervalSec = 30;
+
+
+        private string threadWatcherFilename = "";
+
+
+        private List<(DateTime Time, int Count)> threadWatcherHistory = new();
+
         /// <summary>
         /// Loaded configuration values from MemLeakInspectorConfig.json.
         /// </summary>
@@ -135,6 +147,22 @@ namespace MemLeakInspector
             RegisterServerCommands(api);
 
             config = api.LoadModConfig<MemLeakInspectorConfig>("MemLeakInspectorConfig.json") ?? new MemLeakInspectorConfig();
+            
+            if (config.AutoStartThreadWatcher)
+            {
+                threadWatcherRunning = true;
+                threadWatcherIntervalSec = Math.Max(2, config.ThreadWatcherIntervalSeconds);
+                threadWatcherFilename = Path.Combine(snapshotDir, $"threadlog-{DateTime.Now:yyyyMMdd-HHmmss}.txt");
+
+                threadWatcherHistory.Clear();
+                sapi.World.RegisterCallback(ThreadWatcherTick, 1000);
+                sapi.Logger.Notification("[MemLeakInspector] Auto-started thread watcher.");
+            }
+
+            config.IgnoreSpikeTypeFragments = config.IgnoreSpikeTypeFragments
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
             api.StoreModConfig(config, "MemLeakInspectorConfig.json");
             sapi.Logger.Notification("[MemLeakInspector] Initialized.");
         }
@@ -448,7 +476,43 @@ namespace MemLeakInspector
                         player.Entity.TeleportToDouble(pos.X + 0.5, pos.Y + 1, pos.Z + 0.5);
                         return TextCommandResult.Success($"[MemLeakInspector] Teleported to instance {id}.");
                     })
+                .EndSubCommand()
+
+                .BeginSubCommand("showheat")
+                    .WithDescription("Highlight leaking instances in the world based on snapshot delta.")
+                    .HandleWith(ctx =>
+                    {
+                        return CmdShowHeat();
+                    })
+                .EndSubCommand()
+
+                .BeginSubCommand("threads")
+                    .WithDescription("Show current server process thread stats.")
+                    .HandleWith(ctx => CmdListThreads())
+                .EndSubCommand()
+
+                .BeginSubCommand("threadwatch")
+                    .WithDescription("Start background thread state logging.")
+                    .HandleWith(ctx => {
+                        int interval = 30;
+
+                        if (ctx.Parsers.Count > 0)
+                        {
+                            var rawArg = ctx.Parsers[0].GetValue() as string;
+
+                            if (int.TryParse(rawArg, out var parsed))
+                                interval = parsed;
+                        }
+                        return CmdStartThreadWatch(interval);
+                    })
+                .EndSubCommand()
+
+
+                .BeginSubCommand("threadwatchstop")
+                    .WithDescription("Stop background thread state logging.")
+                    .HandleWith(ctx => CmdStopThreadWatch())
                 .EndSubCommand();
+
 
             sapi.Logger.Notification("[MemLeakInspector] Chat commands registered.");
 
@@ -1087,6 +1151,145 @@ namespace MemLeakInspector
             return TextCommandResult.Success("[MemLeakInspector] Memory usage report complete.");
         }
 
+        /// <summary>
+        /// Detects leaking types and sends tracked instance positions to clients for visual highlighting.
+        /// </summary>
+        /// <returns>Command result with success or error message.</returns>
+        /// <remarks>
+        /// Requires TrackIndividualEntities to be enabled. Sends a custom packet to all players with highlight data.
+        /// </remarks>
+        private TextCommandResult CmdShowHeat()
+        {
+            if (!config!.TrackIndividualEntities)
+                return TextCommandResult.Error("[MemLeakInspector] Instance tracking must be enabled.");
+
+            if (lastAlertSnapshot == null)
+                return TextCommandResult.Error("[MemLeakInspector] No snapshot history available.");
+
+            var current = TakeSnapshot(config);
+
+            var heat = new List<MemLeakInspectorHighlightPacket.HighlightGroup>();
+
+            foreach (var kv in current.ObjectCountsByType)
+            {
+                int previous = lastAlertSnapshot.ObjectCountsByType.TryGetValue(kv.Key, out int val) ? val : 0;
+                int delta = kv.Value - previous;
+
+                if (delta >= heatThreshold &&
+                    current.TrackedInstancesByType?.TryGetValue(kv.Key, out var list) == true)
+                {
+                    var positions = list.Where(i => i.Pos != null).Select(i => i.Pos!).ToList();
+                    heat.Add(new MemLeakInspectorHighlightPacket.HighlightGroup
+                    {
+                        Type = kv.Key,
+                        Positions = positions
+                    });
+                }
+            }
+
+            if (heat.Count == 0)
+                return TextCommandResult.Success("[MemLeakInspector] No high-growth types found.");
+
+            var packet = new MemLeakInspectorHighlightPacket
+            {
+                Highlights = heat
+            };
+
+            foreach (var player in sapi.World.AllOnlinePlayers)
+            {
+                if (player is IServerPlayer serverPlayer)
+                {
+                    sapi.Network
+                        .GetChannel("memleakinspector")
+                        .SendPacket(packet, serverPlayer);
+                }
+            }
+
+            lastAlertSnapshot = current;
+            return TextCommandResult.Success($"[MemLeakInspector] Sent heatmap for {heat.Count} leaking types.");
+        }
+
+        /// <summary>
+        /// Reports the current process threads and their CPU usage.
+        /// </summary>
+        /// <returns>A list of active thread stats including CPU time and wait state.</returns>
+        /// <remarks>
+        /// Experimental. Output includes total threads, individual state, and CPU time. Not all data is always accessible.
+        /// </remarks>
+        private TextCommandResult CmdListThreads()
+        {
+            var proc = System.Diagnostics.Process.GetCurrentProcess();
+            var threads = proc.Threads;
+
+            var lines = new List<string>();
+            lines.Add($"[MemLeakInspector] Thread snapshot captured at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            lines.Add($"Total threads: {threads.Count}");
+
+            foreach (System.Diagnostics.ProcessThread thread in threads)
+            {
+                string status = $"#{thread.Id}";
+
+                try
+                {
+                    status += $" State={thread.ThreadState}";
+
+                    if (thread.ThreadState == System.Diagnostics.ThreadState.Wait)
+                        status += $" WaitReason={thread.WaitReason}";
+
+                    status += $" TotalCPU={thread.TotalProcessorTime.TotalMilliseconds:0}ms";
+                }
+                catch
+                {
+                    status += " [Info not accessible]";
+                }
+
+                lines.Add(status);
+            }
+            string filename = Path.Combine(snapshotDir, $"threads-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+            File.WriteAllLines(filename, lines);
+            return TextCommandResult.Success($"[MemLeakInspector] Exported {threads.Count} threads to: {Path.GetFileName(filename)}");
+        }
+
+        private TextCommandResult CmdStartThreadWatch(int intervalSec)
+        {
+            if (threadWatcherRunning)
+                return TextCommandResult.Success("[MemLeakInspector] Thread watcher already running.");
+
+            threadWatcherRunning = true;
+            threadWatcherIntervalSec = Math.Max(2, intervalSec); // Minimum 2 sec
+            threadWatcherFilename = Path.Combine(snapshotDir, $"threadlog-{DateTime.Now:yyyyMMdd-HHmmss}.txt");
+
+            threadWatcherHistory.Clear(); // Reset history if graphing
+            sapi.World.RegisterCallback(ThreadWatcherTick, 1000);
+
+            return TextCommandResult.Success($"[MemLeakInspector] Thread watcher started. Interval: {threadWatcherIntervalSec}s");
+        }
+
+        private TextCommandResult CmdStopThreadWatch()
+        {
+            if (!threadWatcherRunning)
+                return TextCommandResult.Success("[MemLeakInspector] Thread watcher is not running.");
+            if (threadWatcherHistory.Count > 1)
+            {
+                string summaryPath = Path.Combine(snapshotDir, $"threadgraph-{DateTime.Now:yyyyMMdd-HHmmss}.txt");
+
+                var lines = new List<string>();
+                int max = threadWatcherHistory.Max(e => e.Count);
+
+                foreach (var entry in threadWatcherHistory)
+                {
+                    string bar = new string('#', (int)(entry.Count / (float)max * 40));
+                    lines.Add($"[{entry.Time:HH:mm:ss}] {entry.Count,3} | {bar}");
+                }
+
+                File.WriteAllLines(summaryPath, lines);
+                sapi.Logger.Notification($"[MemLeakInspector] Saved thread graph: {Path.GetFileName(summaryPath)}");
+            }
+            threadWatcherRunning = false;
+            return TextCommandResult.Success("[MemLeakInspector] Thread watcher stopped.");
+        }
+
+
         #endregion
 
         #region Snapshot Logic
@@ -1357,6 +1560,48 @@ namespace MemLeakInspector
             {
                 return instanceCount * 300;
             }
+        }
+
+        private void ThreadWatcherTick(float dt)
+        {
+            if (!threadWatcherRunning) return;
+
+            try
+            {
+                var proc = System.Diagnostics.Process.GetCurrentProcess();
+                var threads = proc.Threads;
+                threadWatcherHistory.Add((DateTime.Now, threads.Count));
+                var now = DateTime.Now;
+
+                var lines = new List<string>();
+                lines.Add($"[{now:HH:mm:ss}] Threads: {threads.Count}");
+
+                foreach (System.Diagnostics.ProcessThread thread in threads)
+                {
+                    string status = $"  - ID {thread.Id}";
+                    try
+                    {
+                        status += $" | State: {thread.ThreadState}";
+                        if (thread.ThreadState == System.Diagnostics.ThreadState.Wait)
+                            status += $" | Wait: {thread.WaitReason}";
+                        status += $" | CPU: {thread.TotalProcessorTime}";
+                    }
+                    catch
+                    {
+                        status += " | [unreadable]";
+                    }
+
+                    lines.Add(status);
+                }
+
+                File.AppendAllLines(threadWatcherFilename, lines);
+            }
+            catch (Exception ex)
+            {
+                sapi.Logger.Warning($"[MemLeakInspector] ThreadWatcher error: {ex.Message}");
+            }
+
+            sapi.World.RegisterCallback(ThreadWatcherTick, threadWatcherIntervalSec * 1000);
         }
 
         /// <summary>

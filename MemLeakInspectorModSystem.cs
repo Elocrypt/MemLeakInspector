@@ -1,8 +1,11 @@
 ﻿using HarmonyLib;
 using System.Reflection;
 using System.Text.Json;
+using System.Xml.Linq;
 using Vintagestory.API.Common;
+using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
+using Vintagestory.Client.NoObf;
 
 
 namespace MemLeakInspector
@@ -119,7 +122,7 @@ namespace MemLeakInspector
         private string threadWatcherFilename = "";
 
 
-        private List<(DateTime Time, int Count)> threadWatcherHistory = new();
+        private List<ThreadSnapshotEntry> threadWatcherHistory = new();
 
         /// <summary>
         /// Loaded configuration values from MemLeakInspectorConfig.json.
@@ -493,7 +496,8 @@ namespace MemLeakInspector
 
                 .BeginSubCommand("threadwatch")
                     .WithDescription("Start background thread state logging.")
-                    .HandleWith(ctx => {
+                    .HandleWith(ctx =>
+                    {
                         int interval = 30;
 
                         if (ctx.Parsers.Count > 0)
@@ -507,12 +511,20 @@ namespace MemLeakInspector
                     })
                 .EndSubCommand()
 
-
                 .BeginSubCommand("threadwatchstop")
                     .WithDescription("Stop background thread state logging.")
                     .HandleWith(ctx => CmdStopThreadWatch())
-                .EndSubCommand();
+                .EndSubCommand()
 
+                .BeginSubCommand("threadexport")
+                    .WithDescription("Export the recorded threadwatch logs to a CSV file.")
+                    .HandleWith(_ => CmdExportThreadWatchCsv())
+                .EndSubCommand()
+
+                .BeginSubCommand("threaddump")
+                    .WithDescription("Export current thread watcher history to a JSON file.")
+                    .HandleWith(_ => CmdExportThreadHistoryJson())
+                .EndSubCommand();
 
             sapi.Logger.Notification("[MemLeakInspector] Chat commands registered.");
 
@@ -633,22 +645,31 @@ namespace MemLeakInspector
         /// Saves a snapshot of the current state to a uniquely named JSON file.
         /// </summary>
         /// <param name="name">The custom or auto-generated filename (no extension).</param>
+        /// <param name="isAuto"></param>
         /// <returns>Success message indicating that snapshotting has started.</returns>
         /// <remarks>
         /// Runs in a background thread to avoid stalling server tick. JSON is saved in the mod's snapshot directory.
         /// </remarks>
-        private TextCommandResult CmdMemSnap(string name)
+        private TextCommandResult CmdMemSnap(string name, bool isAuto = false)
         {
             Task.Run(() =>
             {
                 try
                 {
                     var snapshot = TakeSnapshot(config);
-                    var json = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true });
-                    var filePath = Path.Combine(snapshotDir, $"{name}.json");
-                    File.WriteAllText(filePath, json);
 
-                    sapi.Logger.Notification($"[MemLeakInspector] Snapshot '{name}' saved ({snapshot.TotalManagedMemoryBytes / 1024 / 1024} MB)");
+                    string folder = isAuto ? Path.Combine(snapshotDir, "autosnap") : snapshotDir;
+                    if (!Directory.Exists(folder))
+                        Directory.CreateDirectory(folder);
+
+                    var safeName = string.IsNullOrWhiteSpace(name)
+                        ? $"snapshot-{DateTime.UtcNow:yyyyMMdd-HHmmss}"
+                        : name;
+
+                    var path = Path.Combine(folder, safeName + ".json");
+                    SaveSnapshotToFile(snapshot, path);
+
+                    sapi.Logger.Notification($"[MemLeakInspector] Snapshot saved: {safeName}.json");
                 }
                 catch (Exception ex)
                 {
@@ -669,6 +690,22 @@ namespace MemLeakInspector
         /// Tracks both instance counts and specific added/removed instance IDs if available in both snapshots.
         /// </remarks>
         private TextCommandResult CmdDiffSnapshots(string nameA, string nameB)
+        {
+            if (!config.EnableAsyncCommands)
+            {
+                return InternalDiffSnapshots(nameA, nameB, null);
+            }
+
+            _ = Task.Run(() =>
+            {
+                var result = InternalDiffSnapshots(nameA, nameB, null);
+                sapi.Logger.Notification(result.StatusMessage);
+            });
+
+            return TextCommandResult.Success("[MemLeakInspector] Snapshot diff started in background...");
+        }
+
+        private TextCommandResult InternalDiffSnapshots(string nameA, string nameB, IServerPlayer? player)
         {
             string fileA = Path.Combine(snapshotDir, $"{nameA}.json");
             string fileB = Path.Combine(snapshotDir, $"{nameB}.json");
@@ -702,7 +739,8 @@ namespace MemLeakInspector
                     if (delta != 0)
                         resultLines.Add($"{(delta > 0 ? "+" : "")}{delta,4}  {key}");
                 }
-                if (config!.TrackIndividualEntities &&
+
+                if (config.TrackIndividualEntities &&
                     snapA.TrackedInstancesByType != null &&
                     snapB.TrackedInstancesByType != null)
                 {
@@ -738,10 +776,8 @@ namespace MemLeakInspector
 
                 string exportFile = Path.Combine(snapshotDir, $"diff_{nameA}_to_{nameB}.txt");
                 File.WriteAllLines(exportFile, resultLines);
-                resultLines.Add($"Diff exported to: {Path.GetFileName(exportFile)}");
 
-
-                return TextCommandResult.Success(string.Join("\n", resultLines));
+                return TextCommandResult.Success($"Diff exported to: {Path.GetFileName(exportFile)}");
             }
             catch (Exception ex)
             {
@@ -757,7 +793,24 @@ namespace MemLeakInspector
         /// <remarks>
         /// Output is printed in chat for quick inspection. Only counts are shown, not memory estimates.
         /// </remarks>
+
         private TextCommandResult CmdReportSnapshot(string name)
+        {
+            if (!config.EnableAsyncCommands)
+            {
+                return InternalCmdReportSnapshot(name);
+            }
+
+            _ = Task.Run(() =>
+            {
+                var result = InternalCmdReportSnapshot(name);
+                sapi.Logger.Notification(result.StatusMessage);
+            });
+
+            return TextCommandResult.Success("[MemLeakInspector] Snapshot report running in background...");
+        }
+
+        private TextCommandResult InternalCmdReportSnapshot(string name)
         {
             string filePath = Path.Combine(snapshotDir, $"{name}.json");
 
@@ -869,7 +922,24 @@ namespace MemLeakInspector
         /// Useful for quickly diagnosing leak-prone or noisy systems over time.
         /// Printed output ranks types by the absolute delta.
         /// </remarks>
+
         private TextCommandResult CmdHeatmap(string oldName, string newName)
+        {
+            if (!config.EnableAsyncCommands)
+            {
+                return InternalCmdHeatmap(oldName, newName);
+            }
+
+            _ = Task.Run(() =>
+            {
+                var result = InternalCmdHeatmap(oldName, newName);
+                sapi.Logger.Notification(result.StatusMessage);
+            });
+
+            return TextCommandResult.Success("[MemLeakInspector] Heatmap diff is running in background...");
+        }
+
+        private TextCommandResult InternalCmdHeatmap(string oldName, string newName)
         {
             string pathA = Path.Combine(snapshotDir, $"{oldName}.json");
             string pathB = Path.Combine(snapshotDir, $"{newName}.json");
@@ -877,37 +947,46 @@ namespace MemLeakInspector
             if (!File.Exists(pathA) || !File.Exists(pathB))
                 return TextCommandResult.Error("[MemLeakInspector] One or both snapshot files not found.");
 
-            var oldSnap = JsonSerializer.Deserialize<MemSnapshot>(File.ReadAllText(pathA));
-            var newSnap = JsonSerializer.Deserialize<MemSnapshot>(File.ReadAllText(pathB));
-
-            if (oldSnap == null || newSnap == null)
-                return TextCommandResult.Error("[MemLeakInspector] Failed to load snapshot(s).");
-
-            var deltas = new Dictionary<string, int>();
-
-            foreach (var key in oldSnap.ObjectCountsByType.Keys.Union(newSnap.ObjectCountsByType.Keys))
+            try
             {
-                int oldVal = oldSnap.ObjectCountsByType.TryGetValue(key, out var v1) ? v1 : 0;
-                int newVal = newSnap.ObjectCountsByType.TryGetValue(key, out var v2) ? v2 : 0;
+                var oldSnap = JsonSerializer.Deserialize<MemSnapshot>(File.ReadAllText(pathA));
+                var newSnap = JsonSerializer.Deserialize<MemSnapshot>(File.ReadAllText(pathB));
 
-                int delta = newVal - oldVal;
-                if (delta != 0)
-                    deltas[key] = delta;
+                if (oldSnap == null || newSnap == null)
+                    return TextCommandResult.Error("[MemLeakInspector] Failed to load snapshot(s).");
+
+                var deltas = new Dictionary<string, int>();
+
+                foreach (var key in oldSnap.ObjectCountsByType.Keys.Union(newSnap.ObjectCountsByType.Keys))
+                {
+                    int v1 = oldSnap.ObjectCountsByType.TryGetValue(key, out var a) ? a : 0;
+                    int v2 = newSnap.ObjectCountsByType.TryGetValue(key, out var b) ? b : 0;
+                    int delta = v2 - v1;
+                    if (delta != 0)
+                        deltas[key] = delta;
+                }
+
+                if (deltas.Count == 0)
+                    return TextCommandResult.Success("[MemLeakInspector] No changes detected.");
+
+                sapi.Logger.Notification($"[MemLeakInspector] Heatmap: {oldName} → {newName}");
+
+                foreach (var entry in deltas.OrderByDescending(kv => Math.Abs(kv.Value)).Take(10))
+                {
+                    string sign = entry.Value > 0 ? "+" : "";
+                    sapi.Logger.Notification($"    {sign}{entry.Value,5}  {entry.Key}");
+                }
+
+                lastAlertSnapshot = newSnap;
+
+                return TextCommandResult.Success("[MemLeakInspector] Heatmap generated.");
             }
-
-            if (deltas.Count == 0)
-                return TextCommandResult.Success("[MemLeakInspector] No changes detected.");
-
-            sapi.Logger.Notification($"[MemLeakInspector] Heatmap: {oldName} → {newName}");
-
-            foreach (var entry in deltas.OrderByDescending(kv => Math.Abs(kv.Value)).Take(10))
+            catch (Exception ex)
             {
-                string sign = entry.Value > 0 ? "+" : "";
-                sapi.Logger.Notification($"  {sign}{entry.Value,5}  {entry.Key}");
+                return TextCommandResult.Error($"[MemLeakInspector] Error generating heatmap: {ex.Message}");
             }
-
-            return TextCommandResult.Success("[MemLeakInspector] Heatmap generated.");
         }
+
 
         /// <summary>
         /// Exports the heatmap-style delta of two snapshots to a CSV file.
@@ -922,8 +1001,10 @@ namespace MemLeakInspector
         {
             string pathA = Path.Combine(snapshotDir, $"{oldName}.json");
             string pathB = Path.Combine(snapshotDir, $"{newName}.json");
-            string exportPath = Path.Combine(snapshotDir, $"heatmap_{oldName}_to_{newName}.csv");
+            string exportDir = Path.Combine(snapshotDir, "exports");
+            string exportPath = Path.Combine(exportDir, $"heatmap_{oldName}_to_{newName}.csv");
 
+            if (!Directory.Exists(exportDir)) Directory.CreateDirectory(exportDir);
             if (!File.Exists(pathA) || !File.Exists(pathB))
                 return TextCommandResult.Error("[MemLeakInspector] One or both snapshot files not found.");
 
@@ -965,7 +1046,24 @@ namespace MemLeakInspector
         /// This helps reveal persistent high-memory or overused systems.
         /// Shows relative frequency and estimated memory size per type.
         /// </remarks>
+
         private TextCommandResult CmdSummary(int snapshotCount)
+        {
+            if (!config.EnableAsyncCommands)
+            {
+                return InternalCmdSummary(snapshotCount);
+            }
+
+            _ = Task.Run(() =>
+            {
+                var result = InternalCmdSummary(snapshotCount);
+                sapi.Logger.Notification(result.StatusMessage);
+            });
+
+            return TextCommandResult.Success("[MemLeakInspector] Snapshot summary queued...");
+        }
+
+        private TextCommandResult InternalCmdSummary(int snapshotCount)
         {
             var files = Directory.GetFiles(snapshotDir, "*.json")
                 .OrderByDescending(f => File.GetLastWriteTime(f))
@@ -1030,7 +1128,24 @@ namespace MemLeakInspector
         /// <remarks>
         /// Useful for graphing leak growth in Excel or plotting tools.
         /// </remarks>
+
         private TextCommandResult CmdGraphType(string typeName, int limit)
+        {
+            if (!config.EnableAsyncCommands)
+            {
+                return InternalCmdGraphType(typeName, limit);
+            }
+
+            _ = Task.Run(() =>
+            {
+                var result = InternalCmdGraphType(typeName, limit);
+                sapi.Logger.Notification(result.StatusMessage);
+            });
+
+            return TextCommandResult.Success("[MemLeakInspector] Graph export queued...");
+        }
+
+        private TextCommandResult InternalCmdGraphType(string typeName, int limit)
         {
             var files = Directory.GetFiles(snapshotDir, "*.json")
                 .OrderByDescending(File.GetLastWriteTime)
@@ -1158,15 +1273,35 @@ namespace MemLeakInspector
         /// <remarks>
         /// Requires TrackIndividualEntities to be enabled. Sends a custom packet to all players with highlight data.
         /// </remarks>
+
         private TextCommandResult CmdShowHeat()
         {
-            if (!config!.TrackIndividualEntities)
+            if (!config.EnableAsyncCommands)
+            {
+                return InternalCmdShowHeat();
+            }
+
+            _ = Task.Run(() =>
+            {
+                var result = InternalCmdShowHeat();
+                sapi.Logger.Notification(result.StatusMessage);
+            });
+
+            return TextCommandResult.Success("[MemLeakInspector] ShowHeat started in background...");
+        }
+
+        private TextCommandResult InternalCmdShowHeat()
+        {
+            if (!config?.TrackIndividualEntities ?? true)
                 return TextCommandResult.Error("[MemLeakInspector] Instance tracking must be enabled.");
 
-            if (lastAlertSnapshot == null)
+            if (lastAlertSnapshot?.ObjectCountsByType == null)
                 return TextCommandResult.Error("[MemLeakInspector] No snapshot history available.");
 
             var current = TakeSnapshot(config);
+
+            if (current?.TrackedInstancesByType == null)
+                return TextCommandResult.Error("[MemLeakInspector] Current snapshot is missing tracked instance data.");
 
             var heat = new List<MemLeakInspectorHighlightPacket.HighlightGroup>();
 
@@ -1178,11 +1313,32 @@ namespace MemLeakInspector
                 if (delta >= heatThreshold &&
                     current.TrackedInstancesByType?.TryGetValue(kv.Key, out var list) == true)
                 {
-                    var positions = list.Where(i => i.Pos != null).Select(i => i.Pos!).ToList();
+                    var positions = list
+                        .Select(i =>
+                        {
+                            var type = i.GetType();
+                            var posProp = type.GetProperty("Position");
+                            var position = posProp?.GetValue(i);
+
+                            if (position == null) return null;
+
+                            var xProp = position.GetType().GetProperty("X");
+                            var yProp = position.GetType().GetProperty("Y");
+                            var zProp = position.GetType().GetProperty("Z");
+
+                            if (xProp?.GetValue(position) is not int px ||
+                                yProp?.GetValue(position) is not int py ||
+                                zProp?.GetValue(position) is not int pz)
+                                return null;
+
+                            return new BlockPos(px, py, pz);
+                        })
+                        .Where(p => p != null)
+                        .ToList();
                     heat.Add(new MemLeakInspectorHighlightPacket.HighlightGroup
                     {
                         Type = kv.Key,
-                        Positions = positions
+                        Positions = positions ?? new List<BlockPos>(),
                     });
                 }
             }
@@ -1207,6 +1363,26 @@ namespace MemLeakInspector
 
             lastAlertSnapshot = current;
             return TextCommandResult.Success($"[MemLeakInspector] Sent heatmap for {heat.Count} leaking types.");
+        }
+
+        /// <summary>
+        /// Lists all available snapshot files found in the configured snapshot directory.
+        /// </summary>
+        /// <returns>Command result with filenames listed in chat.</returns>
+        /// <remarks>
+        /// Each snapshot is saved as a .json file, timestamped and optionally named.
+        /// </remarks>
+        private TextCommandResult CmdListSnapshots()
+        {
+            if (!Directory.Exists(snapshotDir))
+                return TextCommandResult.Error("[MemLeakInspector] Snapshot folder not found.");
+
+            string[] files = Directory.GetFiles(snapshotDir, "*.json");
+            if (files.Length == 0)
+                return TextCommandResult.Success("[MemLeakInspector] No snapshots found.");
+
+            string output = "[MemLeakInspector] Snapshots:\n" + string.Join("\n", files.Select(f => Path.GetFileName(f)));
+            return TextCommandResult.Success(output);
         }
 
         /// <summary>
@@ -1274,12 +1450,13 @@ namespace MemLeakInspector
                 string summaryPath = Path.Combine(snapshotDir, $"threadgraph-{DateTime.Now:yyyyMMdd-HHmmss}.txt");
 
                 var lines = new List<string>();
-                int max = threadWatcherHistory.Max(e => e.Count);
+                int max = threadWatcherHistory.Max(e => e.Threads.Count);
 
                 foreach (var entry in threadWatcherHistory)
                 {
-                    string bar = new string('#', (int)(entry.Count / (float)max * 40));
-                    lines.Add($"[{entry.Time:HH:mm:ss}] {entry.Count,3} | {bar}");
+                    int count = entry.Threads.Count;
+                    string bar = new string('#', (int)(entry.Threads.Count / (float)max * 40));
+                    lines.Add($"[{entry.Timestamp:HH:mm:ss}] {entry.Threads.Count,3} | {bar}");
                 }
 
                 File.WriteAllLines(summaryPath, lines);
@@ -1289,6 +1466,63 @@ namespace MemLeakInspector
             return TextCommandResult.Success("[MemLeakInspector] Thread watcher stopped.");
         }
 
+        /// <summary>
+        /// Exports the full thread watcher history to CSV format for external analysis.
+        /// </summary>
+        private TextCommandResult CmdExportThreadWatchCsv()
+        {
+            if (threadWatcherHistory.Count == 0)
+                return TextCommandResult.Error("[MemLeakInspector] No threadwatch data to export.");
+
+            try
+            {
+                string exportDir = Path.Combine(snapshotDir, "exports");
+                if (!Directory.Exists(exportDir)) Directory.CreateDirectory(exportDir);
+
+                string path = Path.Combine(exportDir, $"threadwatch-{DateTime.UtcNow:yyyyMMdd_HHmmss}.csv");
+
+                using var writer = new StreamWriter(path);
+                writer.WriteLine("Timestamp,ThreadId,State,WaitReason,TotalCpuMs");
+
+                foreach (var entry in threadWatcherHistory)
+                {
+                    foreach (var thread in entry.Threads)
+                    {
+                        writer.WriteLine($"{entry.Timestamp:O},{thread.Id},{thread.State},{thread.WaitReason},{thread.CpuTimeMs}");
+                    }
+                }
+
+                sapi.Logger.Notification($"[MemLeakInspector] Exported threadwatch CSV: {Path.GetFileName(path)}");
+                return TextCommandResult.Success("[MemLeakInspector] Threadwatch exported to CSV.");
+            }
+            catch (Exception ex)
+            {
+                return TextCommandResult.Error($"[MemLeakInspector] Failed to export threadwatch: {ex.Message}");
+            }
+        }
+
+        private TextCommandResult CmdExportThreadHistoryJson()
+        {
+            if (threadWatcherHistory.Count == 0)
+                return TextCommandResult.Error("[MemLeakInspector] No thread history to export.");
+
+            try
+            {
+                string exportDir = Path.Combine(snapshotDir, "threaddump");
+                if (!Directory.Exists(exportDir)) Directory.CreateDirectory(exportDir);
+
+                string file = Path.Combine(exportDir, $"threadhistory-{DateTime.UtcNow:yyyyMMdd_HHmmss}.json");
+                var json = JsonSerializer.Serialize(threadWatcherHistory);
+                File.WriteAllText(file, json);
+
+                sapi.Logger.Notification($"[MemLeakInspector] Thread history exported to: {Path.GetFileName(file)}");
+                return TextCommandResult.Success($"[MemLeakInspector] Exported thread history: {Path.GetFileName(file)}");
+            }
+            catch (Exception ex)
+            {
+                return TextCommandResult.Error($"[MemLeakInspector] Failed to export thread history: {ex.Message}");
+            }
+        }
 
         #endregion
 
@@ -1316,7 +1550,7 @@ namespace MemLeakInspector
             {
                 instanceIds = InstanceTracker.GetInstanceInfoByType();
             }
-
+            
             var snapshot = new MemSnapshot
             {
                 Timestamp = DateTime.UtcNow,
@@ -1351,8 +1585,10 @@ namespace MemLeakInspector
                     .ToDictionary(kvp => kvp.Key, kvp => kvp.Value)
             };
 
-            var path = Path.Combine(snapshotDir, $"{snap.Timestamp:yyyyMMdd_HHmmss}.json");
-            File.WriteAllText(path, JsonSerializer.Serialize(snap));
+            string exportDir = Path.Combine(snapshotDir, "exports");
+            if (!Directory.Exists(exportDir)) Directory.CreateDirectory(exportDir);
+            var path = Path.Combine(exportDir, $"filtered-{typeFilter}-{snap.Timestamp:yyyyMMdd_HHmmss}.json");
+            SaveSnapshotToFile(snap, path);
             sapi.Logger.Notification($"[MemLeakInspector] Snapshot filtered by '{typeFilter}' written to: {path}");
         }
 
@@ -1371,26 +1607,6 @@ namespace MemLeakInspector
         #endregion
 
         #region Helpers
-
-        /// <summary>
-        /// Lists all available snapshot files found in the configured snapshot directory.
-        /// </summary>
-        /// <returns>Command result with filenames listed in chat.</returns>
-        /// <remarks>
-        /// Each snapshot is saved as a .json file, timestamped and optionally named.
-        /// </remarks>
-        private TextCommandResult CmdListSnapshots()
-        {
-            if (!Directory.Exists(snapshotDir))
-                return TextCommandResult.Error("[MemLeakInspector] Snapshot folder not found.");
-
-            string[] files = Directory.GetFiles(snapshotDir, "*.json");
-            if (files.Length == 0)
-                return TextCommandResult.Success("[MemLeakInspector] No snapshots found.");
-
-            string output = "[MemLeakInspector] Snapshots:\n" + string.Join("\n", files.Select(f => Path.GetFileName(f)));
-            return TextCommandResult.Success(output);
-        }
 
         private void TrackLoadedEntities(float dt)
         {
@@ -1438,6 +1654,35 @@ namespace MemLeakInspector
         }
 
         /// <summary>
+        /// Saves a safe, flattened version of the snapshot to disk with no cyclic references.
+        /// </summary>
+        /// <param name="snapshot">The MemSnapshot instance to save.</param>
+        /// <param name="filepath">The full path to the output .json file.</param>
+        private void SaveSnapshotToFile(MemSnapshot snapshot, string filepath)
+        {
+            var safeTracked = snapshot.TrackedInstancesByType?.ToDictionary(
+                kv => kv.Key,
+                kv => kv.Value.Select(i => new {
+                    i.Id,
+                    Position = i.Pos == null ? null : new { i.Pos.X, i.Pos.Y, i.Pos.Z }
+                }).ToList<object>()
+            );
+
+            var export = new
+            {
+                snapshot.Timestamp,
+                snapshot.TotalManagedMemoryBytes,
+                snapshot.ObjectCountsByType,
+                TrackedInstancesByType = safeTracked,
+                snapshot.EstimatedBytesPerType,
+                snapshot.EstimatedMemoryBytesPerType
+            };
+
+            var json = JsonSerializer.Serialize(export, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(filepath, json);
+        }
+
+        /// <summary>
         /// Starts an automated snapshotting task that saves the current state on a timed interval.
         /// </summary>
         /// <param name="intervalSec">Interval in seconds between snapshots.</param>
@@ -1455,7 +1700,7 @@ namespace MemLeakInspector
             autoSnapshotListenerId = sapi.Event.RegisterGameTickListener((dt) =>
             {
                 string name = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-                CmdMemSnap(name);
+                CmdMemSnap(name, isAuto: true);
             }, intervalSec * 1000);
         }
 
@@ -1570,27 +1815,74 @@ namespace MemLeakInspector
             {
                 var proc = System.Diagnostics.Process.GetCurrentProcess();
                 var threads = proc.Threads;
-                threadWatcherHistory.Add((DateTime.Now, threads.Count));
                 var now = DateTime.Now;
 
+                // Store in memory
+                threadWatcherHistory.Add(new ThreadSnapshotEntry
+                {
+                    Timestamp = now,
+                    Threads = threads.Cast<System.Diagnostics.ProcessThread>()
+                        .Where(t => t.Id > 0 && (!config.ExcludeSleepingThreads || t.ThreadState != System.Diagnostics.ThreadState.Wait))
+                        .Select(t => new ThreadInfo
+                        {
+                            Id = t.Id,
+                            State = t.ThreadState.ToString(),
+                            WaitReason = t.ThreadState == System.Diagnostics.ThreadState.Wait
+                                ? t.WaitReason.ToString()
+                                : null,
+                            CpuTimeMs = t.TotalProcessorTime.TotalMilliseconds > 0
+                                ? (long)t.TotalProcessorTime.TotalMilliseconds
+                                : 0
+                        })
+                        .ToList()
+                });
+
+                // Prune excess snapshots from memory
+                if (config.EnableThreadSnapshotRotation && config.MaxThreadSnapshotHistory > 0)
+                {
+                    while (threadWatcherHistory.Count > config.MaxThreadSnapshotHistory)
+                    {
+                        threadWatcherHistory.RemoveAt(0);
+                    }
+                }
+
+                if (config.AutoSerializeThreadSnapshots)
+                {
+                    try
+                    {
+                        string autoPath = Path.Combine(snapshotDir, "threadauto");
+                        if (!Directory.Exists(autoPath)) Directory.CreateDirectory(autoPath);
+
+                        string fname = Path.Combine(autoPath, $"thread-{now:yyyyMMdd-HHmmss}.json");
+                        var json = JsonSerializer.Serialize(threadWatcherHistory.Last(), jsonOpts);
+                        File.WriteAllText(fname, json);
+                    }
+                    catch (Exception ex)
+                    {
+                        sapi.Logger.Warning($"[MemLeakInspector] Failed to auto-serialize thread snapshot: {ex.Message}");
+                    }
+                }
+
+                // Write to .txt log
                 var lines = new List<string>();
-                lines.Add($"[{now:HH:mm:ss}] Threads: {threads.Count}");
+                lines.Add($"{now:HH:mm:ss} Threads: {threads.Count}");
 
                 foreach (System.Diagnostics.ProcessThread thread in threads)
                 {
-                    string status = $"  - ID {thread.Id}";
+                    string status = $" - ID {thread.Id}";
                     try
                     {
                         status += $" | State: {thread.ThreadState}";
                         if (thread.ThreadState == System.Diagnostics.ThreadState.Wait)
+                        {
                             status += $" | Wait: {thread.WaitReason}";
+                        }
                         status += $" | CPU: {thread.TotalProcessorTime}";
                     }
                     catch
                     {
                         status += " | [unreadable]";
                     }
-
                     lines.Add(status);
                 }
 
@@ -1614,6 +1906,20 @@ namespace MemLeakInspector
             return config!.IgnoreSpikeTypeFragments.Any(fragment =>
                 typeName.IndexOf(fragment, StringComparison.OrdinalIgnoreCase) >= 0
             );
+        }
+
+        public class ThreadSnapshotEntry
+        {
+            public DateTime Timestamp { get; set; }
+            public List<ThreadInfo> Threads { get; set; } = new();
+        }
+
+        public class ThreadInfo
+        {
+            public int Id { get; set; }
+            public string State { get; set; } = "";
+            public string? WaitReason { get; set; }
+            public long CpuTimeMs { get; set; }
         }
 
         private class WatchedType

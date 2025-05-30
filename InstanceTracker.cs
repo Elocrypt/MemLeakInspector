@@ -1,4 +1,5 @@
-﻿using System.Collections.Concurrent;
+﻿using System.Text.Json.Serialization;
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
@@ -31,7 +32,20 @@ namespace MemLeakInspector
             /// <summary>
             /// The approximate block position of the object, if available.
             /// </summary>
+            [JsonIgnore]
             public BlockPos? Pos { get; set; }
+
+            public FlatPos? Position
+            {
+                get => Pos == null ? null : new FlatPos { X = Pos.X, Y = Pos.Y, Z = Pos.Z };
+                set => Pos = value == null ? null : new BlockPos(value.Value.X, value.Value.Y, value.Value.Z);
+            }
+        }
+        public struct FlatPos
+        {
+            public int X;
+            public int Y;
+            public int Z;
         }
 
         /// <summary>

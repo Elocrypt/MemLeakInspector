@@ -45,7 +45,7 @@
         /// When enabled, tracks individual instances with IDs and positions.
         /// Required for commands like /mem tp and detailed diffs.
         /// </summary>
-        public bool TrackIndividualEntities { get; set; } = false;
+        public bool TrackIndividualEntities { get; set; } = true;
 
         /// <summary>
         /// When enabled, logs individual added/removed IDs when diffing snapshots.
@@ -58,5 +58,31 @@
 
         public int ThreadWatcherIntervalSeconds { get; set; } = 30;
 
+        /// <summary>
+        /// If true, sleeping (ThreadState.Wait) threads are excluded from tracking/logs.
+        /// </summary>
+        public bool ExcludeSleepingThreads { get; set; } = true;
+
+        /// <summary>
+        /// Whether to auto-serialize thread snapshots to disk each tick.
+        /// </summary>
+        public bool AutoSerializeThreadSnapshots { get; set; } = false;
+
+        /// <summary>
+        /// Whether to enable thread snapshot rotation/pruning logic.
+        /// </summary>
+        public bool EnableThreadSnapshotRotation { get; set; } = true;
+
+        /// <summary>
+        /// Maximum number of thread snapshots to keep in memory before pruning old ones.
+        /// </summary>
+        public int MaxThreadSnapshotHistory { get; set; } = 180;
+
+        /// <summary>
+        /// Maximum number of lines shown in in-game diff preview before truncating to file.
+        /// </summary>
+        public int DiffPreviewLines { get; set; } = 15;
+
+        public bool EnableAsyncCommands { get; set; } = true;
     }
 }

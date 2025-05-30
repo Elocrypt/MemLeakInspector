@@ -1,4 +1,6 @@
-﻿namespace MemLeakInspector
+﻿using static MemLeakInspector.InstanceTracker;
+
+namespace MemLeakInspector
 {
     /// <summary>
     /// Represents a snapshot of the current managed memory state, including object counts,
@@ -41,7 +43,7 @@
         /// <remarks>
         /// Enabled via the <c>TrackIndividualEntities</c> config option. Used for highlighting and diffing.
         /// </remarks>
-        public Dictionary<string, List<InstanceTracker.InstanceInfo>>? TrackedInstancesByType { get; set; }
+        public Dictionary<string, List<InstanceInfo>>? TrackedInstancesByType { get; set; }
 
     }
 }

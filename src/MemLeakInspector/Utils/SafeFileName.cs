@@ -7,7 +7,9 @@ namespace MemLeakInspector.Utils;
 /// </summary>
 internal static partial class SafeFileName
 {
-    private static readonly char[] InvalidChars = Path.GetInvalidFileNameChars();
+    // Deterministic across OSes (Windows-invalid filename chars)
+    private static readonly char[] InvalidChars =
+        ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
 
     /// <summary>Replace invalid filename characters with underscores.</summary>
     public static string Sanitize(string input)

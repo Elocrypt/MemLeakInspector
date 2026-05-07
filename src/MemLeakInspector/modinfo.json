@@ -1,0 +1,14 @@
+{
+  "type": "code",
+  "modid": "memleakinspector",
+  "name": "Mem Leak Inspector",
+  "description": "Tools to help you identify memory leaks, excessive object creation, and thread anomalies",
+  "authors": [ "Elocrypt" ],
+  "version": "2.0.0",
+  "requiredonclient": false,
+  "requiredonserver": true,
+  "side": "server",
+  "dependencies": {
+    "game": "1.22.0"
+  }
+}

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Mem Leak Inspector Dashboard</title>
+  <link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+  <div class="header">
+    <h1>Mem Leak Inspector Dashboard</h1>
+    <span class="version">v2.x</span>
+  </div>
+
+  <div class="controls">
+    <div class="file-area">
+      <label for="fileInput" class="file-label">Load .json or .csv</label>
+      <input type="file" id="fileInput" accept=".json,.csv" multiple />
+      <span id="fileName" class="file-name"></span>
+    </div>
+    <div class="buttons">
+      <button onclick="showTab('snapshots')" class="active" id="btn-snapshots">Snapshots</button>
+      <button onclick="showTab('threads')" id="btn-threads">Threads</button>
+    </div>
+  </div>
+
+  <div class="filter-bar">
+    <input type="text" id="filterInput" placeholder="Filter types..." oninput="applyFilter()" />
+    <select id="sortSelect" onchange="reSort()">
+      <option value="count-desc">Count ↓</option>
+      <option value="count-asc">Count ↑</option>
+      <option value="name-asc">Name A-Z</option>
+      <option value="name-desc">Name Z-A</option>
+    </select>
+  </div>
+
+  <div id="snapshots" class="tab-content"></div>
+  <div id="threads" class="tab-content" style="display:none;">
+    <canvas id="threadChart" height="200"></canvas>
+    <div id="threadTable"></div>
+  </div>
+  <div id="status" class="status"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="dashboard.js"></script>
+</body>
+</html>

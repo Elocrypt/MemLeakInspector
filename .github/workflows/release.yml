@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    name: Build, test, package, release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Vintage Story server assemblies
+        run: |
+          set -e
+          mkdir -p "$HOME/vs"
+          curl -fL -o vs.tar.gz "https://cdn.vintagestory.at/gamefiles/stable/vs_server_linux-x64_1.22.2.tar.gz"
+          tar -xzf vs.tar.gz -C "$HOME/vs"
+          echo "VINTAGE_STORY=$HOME/vs" >> "$GITHUB_ENV"
+
+      - name: Restore
+        run: dotnet restore MemLeakInspector.sln
+
+      - name: Build
+        run: dotnet build MemLeakInspector.sln --configuration Release --no-restore /p:DeployMod=false
+
+      - name: Test
+        run: dotnet test MemLeakInspector.sln --configuration Release --no-build --verbosity normal
+
+      - name: Package
+        shell: pwsh
+        run: ./build/package.ps1 -Configuration Release -Version ${{ steps.version.outputs.VERSION }}
+
+      - name: Extract release notes
+        run: |
+          awk -v ver="${{ steps.version.outputs.VERSION }}" '
+            $0 ~ "^## \\[" ver "\\]" { grab = 1; next }
+            grab && /^## \[/ { exit }
+            grab { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "No changelog section found for version ${{ steps.version.outputs.VERSION }}." >&2
+            exit 1
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: build/dist/MemLeakInspector_${{ steps.version.outputs.VERSION }}.zip
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: false

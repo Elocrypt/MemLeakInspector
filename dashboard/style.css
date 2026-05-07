@@ -1,0 +1,124 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: #0a0a0a;
+  color: #c8d6e5;
+  font-family: 'Cascadia Code', 'Fira Code', 'Courier New', monospace;
+  font-size: 13px;
+  padding: 16px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.header h1 {
+  color: #33faff;
+  font-size: 18px;
+}
+.version {
+  color: #666;
+  font-size: 12px;
+}
+
+.controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.file-area {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.file-label {
+  background: #1a1a2e;
+  color: #33faff;
+  border: 1px solid #33faff44;
+  padding: 6px 14px;
+  cursor: pointer;
+  border-radius: 3px;
+  transition: background 0.15s;
+}
+.file-label:hover { background: #222240; }
+#fileInput { display: none; }
+.file-name { color: #666; font-size: 12px; }
+
+.buttons button {
+  background: #111;
+  color: #888;
+  border: 1px solid #333;
+  padding: 6px 14px;
+  cursor: pointer;
+  border-radius: 3px;
+  transition: all 0.15s;
+}
+.buttons button:hover { color: #33faff; border-color: #33faff44; }
+.buttons button.active { color: #33faff; border-color: #33faff; background: #1a1a2e; }
+
+.filter-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.filter-bar input,
+.filter-bar select {
+  background: #111;
+  color: #c8d6e5;
+  border: 1px solid #333;
+  padding: 5px 10px;
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 12px;
+}
+.filter-bar input { flex: 1; }
+.filter-bar select { width: 130px; }
+
+.tab-content {
+  background: #0f0f17;
+  padding: 12px;
+  border: 1px solid #222;
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th, td {
+  padding: 6px 10px;
+  border-bottom: 1px solid #1a1a2e;
+  text-align: left;
+}
+th {
+  color: #33faff;
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+  background: #0f0f17;
+}
+tr:hover td { background: #151525; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.status {
+  margin-top: 8px;
+  color: #555;
+  font-size: 11px;
+}
+
+h2 {
+  color: #33faff;
+  font-size: 14px;
+  margin-bottom: 10px;
+}
+
+canvas { margin-bottom: 16px; }

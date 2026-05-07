@@ -1,0 +1,71 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AssemblyName>MemLeakInspector</AssemblyName>
+    <RootNamespace>MemLeakInspector</RootNamespace>
+    <TargetFramework>net10.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591;MSB3245</NoWarn>
+    <Version>2.0.0</Version>
+    <AssemblyVersion>2.0.0.0</AssemblyVersion>
+    <FileVersion>2.0.0.0</FileVersion>
+    <InformationalVersion>2.0.0</InformationalVersion>
+    <Authors>Elocrypt</Authors>
+    <Product>Mem Leak Inspector</Product>
+    <Description>Detect memory leaks by tracking instance counts over time. Snapshot and tracking tools at runtime.</Description>
+    <Copyright>Copyright (c) 2026 Elocrypt</Copyright>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="0Harmony">
+      <HintPath>$(VintagestoryDir)\Lib\0Harmony.dll</HintPath>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(VintagestoryDir)\Lib\Newtonsoft.Json.dll</HintPath>
+    </Reference>
+    <Reference Include="VintagestoryAPI">
+      <HintPath>$(VintagestoryDir)\VintagestoryAPI.dll</HintPath>
+    </Reference>
+    <Reference Include="VintagestoryLib">
+      <HintPath>$(VintagestoryDir)\VintagestoryLib.dll</HintPath>
+    </Reference>
+    <Reference Include="VSEssentials">
+      <HintPath>$(VintagestoryDir)\Mods\VSEssentials.dll</HintPath>
+    </Reference>
+    <Reference Include="VSSurvivalMod">
+      <HintPath>$(VintagestoryDir)\Mods\VSSurvivalMod.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MemLeakInspector.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="modinfo.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="modicon.png" CopyToOutputDirectory="PreserveNewest" Condition="Exists('modicon.png')" />
+    <Content Include="assets\**\*.*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="DeployToVintagestoryMods" AfterTargets="Build"
+          Condition="'$(DeployMod)' != 'false' AND Exists('$(VintagestoryData)')">
+    <PropertyGroup>
+      <DeployPath>$(VintagestoryData)\Mods\$(AssemblyName)</DeployPath>
+    </PropertyGroup>
+    <ItemGroup>
+      <_DeployFiles Include="$(OutputPath)**\*.*" Exclude="$(OutputPath)**\*.pdb;$(OutputPath)**\ref\**" />
+    </ItemGroup>
+    <MakeDir Directories="$(DeployPath)" />
+    <Copy SourceFiles="@(_DeployFiles)"
+          DestinationFolder="$(DeployPath)\%(RecursiveDir)"
+          SkipUnchangedFiles="true" />
+    <Message Text="[MemLeakInspector] Deployed to $(DeployPath)" Importance="high" />
+  </Target>
+
+</Project>
